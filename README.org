@@ -1,0 +1,184 @@
+#+TITLE: ok-gtasks - Google Tasks Sync for Org-mode
+#+AUTHOR: Oleksii Koval
+
+Bidirectional sync between Google Tasks and a single Org file.
+
+- =ok-gtasks-pull= fetches tasks from Google into Org (remote wins)
+- =ok-gtasks-push= pushes local changes to Google Tasks (update-or-create)
+
+Built as a literate Org package. See [[file:ok-gtasks.org][ok-gtasks.org]] for full source and implementation details.
+
+* Features
+
+- Bidirectional sync: pull (remote wins) and push (update-or-create)
+- Local-scope operations: sync only the heading at point, not the whole file
+- =C-u= prefix for full sync of all task lists
+- curl-primary HTTP backend (avoids Emacs =url.el= multibyte/Unicode bugs)
+- Reuses existing OAuth2 refresh token (no re-auth needed if you used =gtasks.el=)
+- Property-based tracking: no duplicates on re-import
+- Sub-task support (=***= headings under =**= tasks)
+- Configurable verbosity (quiet / info / debug)
+
+* Org File Structure
+
+Tasks are stored in a single Org file (default =~/org/gtasks.org=):
+
+#+begin_example
+,* My Tasks                           ← Google Tasks list (level 1)
+,** TODO Buy groceries                ← Task (level 2)
+SCHEDULED: <2026-03-20 Fri>
+:PROPERTIES:
+:GTASKS_TASK_ID: abc123
+:GTASKS_LIST_ID: xyz789
+:END:
+Some notes about what to buy.
+,*** TODO Get milk                    ← Sub-task (level 3)
+:PROPERTIES:
+:GTASKS_TASK_ID: def456
+:END:
+,* Work                               ← Another list
+,** DONE Finish report
+#+end_example
+
+* Field Mapping
+
+| Org                   | Google Tasks API      |
+|-----------------------+-----------------------|
+| =*= heading title     | TaskList title        |
+| =**= / =***= title    | Task title            |
+| TODO / DONE           | needsAction/completed |
+| SCHEDULED             | due (RFC3339 UTC)     |
+| CLOSED                | completed timestamp   |
+| Body text (plain)     | notes                 |
+| =***= under =**=      | parent task           |
+| =GTASKS_LIST_ID= prop | tasklist id           |
+| =GTASKS_TASK_ID= prop | task id               |
+| =GTASKS_ETAG= prop    | etag (concurrency)    |
+| =GTASKS_UPDATED= prop | last updated          |
+
+** About Org Tags
+
+Google Tasks has no concept of tags or labels. Org tags (=:work:personal:=) are
+preserved locally but *not synced* to Google Tasks. They remain useful for local
+filtering with =org-agenda= or search, but have no remote equivalent.
+
+* Installation
+
+** Prerequisites
+
+- Emacs 27.1+
+- =curl= (recommended; =url.el= fallback available)
+- A Google Cloud project with the Tasks API enabled
+- OAuth2 client credentials (Desktop/Installed app type)
+
+** Setup
+
+1. Clone or copy this directory:
+
+#+begin_src sh
+git clone https://github.com/avkoval/ok-gtasks ~/.emacs.d/ok-gtasks
+#+end_src
+
+2. Add to your Emacs config:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "~/.emacs.d/ok-gtasks")
+(require 'ok-gtasks)
+
+(setq ok-gtasks-client-id "YOUR_CLIENT_ID.apps.googleusercontent.com"
+      ok-gtasks-client-secret "YOUR_CLIENT_SECRET")
+#+end_src
+
+If you previously used [[https://github.com/thndrbrrr/gtasks][gtasks.el]], ok-gtasks reads the same token file
+(=~/.emacs.d/.gtasks/token.json=) by default --- no re-authorization needed.
+
+3. If you need to authorize from scratch:
+
+#+begin_src
+M-x ok-gtasks-authorize
+#+end_src
+
+This opens your browser for Google consent, then prompts you to paste the
+authorization code.
+
+* Usage
+
+** Pull (fetch from Google)
+
+| Context          | Command              | Effect                      |
+|------------------+----------------------+-----------------------------|
+| In =gtasks.org=  | =ok-gtasks-pull=     | Pull the task list at point |
+| In =gtasks.org=  | =C-u ok-gtasks-pull= | Pull all task lists         |
+| Any other buffer | =ok-gtasks-pull=     | Pull all task lists         |
+
+** Push (send to Google)
+
+| Context          | Command              | Effect                               |
+|------------------+----------------------+--------------------------------------|
+| On =*= heading   | =ok-gtasks-push=     | Push entire list + tasks + sub-tasks |
+| On =**= heading  | =ok-gtasks-push=     | Push task + its sub-tasks            |
+| On =***= heading | =ok-gtasks-push=     | Push single sub-task                 |
+| Any context      | =C-u ok-gtasks-push= | Push all lists                       |
+
+** Typical Workflow
+
+1. =M-x ok-gtasks-pull= (or =C-u ok-gtasks-pull= for all lists) to import tasks
+2. Edit tasks in Org: change TODO states, add SCHEDULED dates, edit body text
+3. Position cursor on the changed heading
+4. =M-x ok-gtasks-push= to sync back to Google
+
+* Configuration
+
+All options are in the =ok-gtasks= customize group (=M-x customize-group ok-gtasks=).
+
+| Variable                  | Default                         | Description                   |
+|---------------------------+---------------------------------+-------------------------------|
+| =ok-gtasks-file=          | =~/org/gtasks.org=              | Org file for synced tasks     |
+| =ok-gtasks-http-backend=  | =auto=                          | =auto= / =curl= / =url=       |
+| =ok-gtasks-client-id=     | nil                             | Google OAuth2 client ID       |
+| =ok-gtasks-client-secret= | nil                             | Client secret (string or fn)  |
+| =ok-gtasks-token-file=    | =~/.emacs.d/.gtasks/token.json= | OAuth2 refresh token location |
+| =ok-gtasks-api-root=      | =https://...googleapis.com/...= | Google Tasks API base URL     |
+| =ok-gtasks-timeout=       | 60                              | HTTP timeout in seconds       |
+| =ok-gtasks-log-level=     | =info=                          | =quiet= / =info= / =debug=    |
+
+** Log Levels
+
+- =quiet= :: Only errors and final summary (e.g. "3 new, 5 updated, 0 orphaned")
+- =info= :: Per-list progress (e.g. "pulling list: My Tasks")
+- =debug= :: Every individual task operation with its title
+
+* Body Text Handling
+
+When pushing to Google Tasks, the =notes= field contains only plain body text.
+All Org metadata is stripped automatically:
+
+- Property drawers (=:PROPERTIES:...:END:=)
+- Planning lines (SCHEDULED, DEADLINE, CLOSED)
+- LOGBOOK drawers and state-change entries
+- Bare timestamps
+
+If a heading has no meaningful text (only metadata), =notes= is left empty.
+
+* Acknowledgments
+
+This package was inspired by and references code from:
+
+- [[https://github.com/thndrbrrr/gtasks][gtasks.el]] by thndrbrrr --- Google Tasks API client for Emacs (OAuth2 flow, API paths, pagination patterns)
+- [[https://github.com/thndrbrrr/gtasks-org-tools][gtasks-org-tools.el]] by thndrbrrr --- Org import/export for Google Tasks (date conversion, body text cleaning)
+
+ok-gtasks was built as a clean replacement to solve several issues with the
+original packages: multibyte/Unicode errors with =url.el=, lack of bidirectional
+sync (duplicates on re-import), no update-in-place, and advice-based curl
+workarounds.
+
+The HTTP backend pattern (curl via =call-process-region= with
+=set-buffer-multibyte nil=) follows the approach used in the author's
+[[file:../youtrack/youtrack.org][youtrack.el]] YouTrack integration.
+
+* License
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [[file:LICENSE][LICENSE]] for details.

@@ -1,0 +1,992 @@
+#+TITLE: ok-gtasks - Google Tasks Sync for Org-mode
+#+AUTHOR: Oleksii
+#+PROPERTY: header-args:emacs-lisp :tangle ok-gtasks.el :results silent
+
+* Package Header
+
+#+begin_src emacs-lisp
+;;; ok-gtasks.el --- Google Tasks bidirectional sync for Org-mode -*- lexical-binding: t; -*-
+
+;; Author: Oleksii
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1"))
+;; Keywords: org, google, tasks, sync
+;; URL: https://github.com/oleksii/ok-gtasks
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Bidirectional sync between Google Tasks and a single Org file.
+;; - `ok-gtasks-pull' fetches remote tasks into ~/org/gtasks.org (remote wins)
+;; - `ok-gtasks-push' pushes local changes to Google Tasks (update-or-create)
+;;
+;; Structure: * = task list, ** = task, *** = sub-task
+;; Tracking: GTASKS_LIST_ID, GTASKS_TASK_ID properties on each heading
+;;
+;; Uses curl for HTTP to avoid Emacs url.el multibyte bugs.
+;;
+;; See ok-gtasks.org for the full literate source and documentation.
+
+;;; Code:
+
+(require 'json)
+(require 'url)
+(require 'org)
+(require 'cl-lib)
+(require 'subr-x)
+#+end_src
+
+* Configuration
+
+#+begin_src emacs-lisp
+(defgroup ok-gtasks nil
+  "Google Tasks bidirectional sync for Org-mode."
+  :group 'tools
+  :prefix "ok-gtasks-")
+
+(defcustom ok-gtasks-file "~/org/gtasks.org"
+  "Org file for Google Tasks sync."
+  :type 'file
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-http-backend 'auto
+  "HTTP backend for API requests.
+`auto' uses curl if available, otherwise falls back to url.el.
+`curl' always uses curl (errors if not found).
+`url' always uses built-in url.el."
+  :type '(choice (const :tag "Auto-detect (prefer curl)" auto)
+                 (const :tag "curl" curl)
+                 (const :tag "url.el (built-in)" url))
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-client-id nil
+  "Google OAuth2 client ID."
+  :type 'string
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-client-secret nil
+  "Google OAuth2 client secret.
+Either a string or a zero-argument function returning the secret."
+  :type '(choice
+          (string :tag "Literal secret")
+          (function :tag "Function returning secret"))
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-token-file
+  (expand-file-name ".gtasks/token.json" user-emacs-directory)
+  "File storing the OAuth2 refresh token."
+  :type 'file
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-api-root "https://www.googleapis.com/tasks/v1"
+  "Base URL for the Google Tasks API."
+  :type 'string
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-timeout 60
+  "Timeout in seconds for HTTP requests."
+  :type 'integer
+  :group 'ok-gtasks)
+
+(defcustom ok-gtasks-log-level 'info
+  "Verbosity level for ok-gtasks messages.
+`quiet' - only errors and final summary.
+`info'  - summary + per-list progress.
+`debug' - every task operation."
+  :type '(choice (const :tag "Quiet (errors + summary)" quiet)
+                 (const :tag "Info (per-list progress)" info)
+                 (const :tag "Debug (every task)" debug))
+  :group 'ok-gtasks)
+
+(define-error 'ok-gtasks-error "ok-gtasks error")
+(define-error 'ok-gtasks-auth-error "ok-gtasks auth error" 'ok-gtasks-error)
+(define-error 'ok-gtasks-http-error "ok-gtasks HTTP error" 'ok-gtasks-error)
+
+(defun ok-gtasks--log (level fmt &rest args)
+  "Log a message at LEVEL (`debug', `info') if `ok-gtasks-log-level' permits."
+  (let ((dominated (pcase ok-gtasks-log-level
+                     ('debug t)
+                     ('info (memq level '(info)))
+                     ('quiet nil))))
+    (when dominated
+      (apply #'message (concat "ok-gtasks: " fmt) args))))
+
+(defvar ok-gtasks--access-token nil
+  "Cached OAuth2 access token.")
+
+(defvar ok-gtasks--access-token-expiry 0
+  "Expiry time of the cached access token (float-time).")
+#+end_src
+
+* HTTP Backend
+
+#+begin_src emacs-lisp
+(defun ok-gtasks--effective-backend ()
+  "Return the HTTP backend to use: `curl' or `url'."
+  (pcase ok-gtasks-http-backend
+    ('auto (if (executable-find "curl") 'curl 'url))
+    ('curl (unless (executable-find "curl")
+             (error "curl not found; set `ok-gtasks-http-backend' to `url'"))
+           'curl)
+    ('url 'url)))
+
+(defun ok-gtasks--json-encode (data)
+  "Encode DATA as a JSON string."
+  (encode-coding-string (json-encode data) 'utf-8))
+
+(defun ok-gtasks--json-parse (string)
+  "Parse JSON STRING into alists with symbol keys.
+Returns nil on empty input or parse error."
+  (when (and string (not (string-empty-p string)))
+    (let ((json-object-type 'alist)
+          (json-array-type 'vector)
+          (json-key-type 'symbol))
+      (condition-case nil
+          (json-read-from-string string)
+        (error nil)))))
+
+(defun ok-gtasks--http-curl (method url headers &optional body)
+  "Perform HTTP request via curl.
+METHOD is the HTTP method string.
+URL is the full URL.
+HEADERS is an alist of header name-value pairs.
+BODY is an optional encoded string.
+Returns (STATUS-CODE . PARSED-JSON)."
+  (let ((args (list "-s" "-X" method "-w" "\n%{http_code}")))
+    (dolist (h headers)
+      (setq args (append args (list "-H" (format "%s: %s" (car h) (cdr h))))))
+    (when body
+      (setq args (append args (list "--data-binary" "@-"))))
+    (setq args (append args (list url)))
+    (with-temp-buffer
+      (let ((out-buf (current-buffer)))
+        (if body
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert body)
+              (apply #'call-process-region (point-min) (point-max)
+                     "curl" nil out-buf nil args))
+          (apply #'call-process "curl" nil out-buf nil args)))
+      ;; Last line is the HTTP status code (from -w flag)
+      (goto-char (point-max))
+      (forward-line 0)
+      (let* ((status (string-to-number
+                      (buffer-substring (point) (line-end-position))))
+             (body-end (1- (point)))
+             (body-str (when (> body-end (point-min))
+                         (buffer-substring (point-min) body-end)))
+             (parsed (ok-gtasks--json-parse body-str)))
+        (cons status parsed)))))
+
+(defun ok-gtasks--http-url (method url headers &optional body)
+  "Perform HTTP request via url.el.
+Same signature as `ok-gtasks--http-curl'.
+Returns (STATUS-CODE . PARSED-JSON)."
+  (let* ((url-request-method method)
+         (url-request-extra-headers
+          (mapcar (lambda (h) (cons (car h) (cdr h))) headers))
+         (url-request-data body)
+         (buf (url-retrieve-synchronously url t t ok-gtasks-timeout)))
+    (unless buf
+      (signal 'ok-gtasks-http-error
+              (list (format "No response: %s %s" method url))))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((status (or (bound-and-true-p url-http-response-status) 0)))
+            (goto-char (point-min))
+            (re-search-forward "\r?\n\r?\n" nil 'move)
+            (let* ((body-str (buffer-substring (point) (point-max)))
+                   (parsed (ok-gtasks--json-parse body-str)))
+              (cons status parsed))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(defun ok-gtasks--http (method url headers &optional body)
+  "Dispatch HTTP request to the configured backend.
+Returns (STATUS-CODE . PARSED-JSON)."
+  (pcase (ok-gtasks--effective-backend)
+    ('curl (ok-gtasks--http-curl method url headers body))
+    ('url (ok-gtasks--http-url method url headers body))))
+#+end_src
+
+* Authentication
+
+#+begin_src emacs-lisp
+(defconst ok-gtasks--oauth-auth-url
+  "https://accounts.google.com/o/oauth2/v2/auth")
+
+(defconst ok-gtasks--oauth-token-url
+  "https://oauth2.googleapis.com/token")
+
+(defconst ok-gtasks--oauth-scope
+  "https://www.googleapis.com/auth/tasks")
+
+(defconst ok-gtasks--redirect-uri
+  "urn:ietf:wg:oauth:2.0:oob")
+
+(defun ok-gtasks--read-refresh-token ()
+  "Read the refresh token from `ok-gtasks-token-file'.
+Returns the token string or nil."
+  (when (file-exists-p ok-gtasks-token-file)
+    (with-temp-buffer
+      (insert-file-contents ok-gtasks-token-file)
+      (let ((data (ok-gtasks--json-parse (buffer-string))))
+        (alist-get 'refresh_token data)))))
+
+(defun ok-gtasks--write-refresh-token (refresh)
+  "Write REFRESH token to `ok-gtasks-token-file'."
+  (let ((dir (file-name-directory ok-gtasks-token-file)))
+    (unless (file-directory-p dir)
+      (make-directory dir t)
+      (ignore-errors (set-file-modes dir #o700))))
+  (with-temp-file ok-gtasks-token-file
+    (insert (json-encode `((refresh_token . ,refresh)
+                           (saved_at . ,(format-time-string "%FT%T%z"))))))
+  (ignore-errors (set-file-modes ok-gtasks-token-file #o600)))
+
+(defun ok-gtasks--client-secret ()
+  "Resolve the configured client secret to a string."
+  (let ((v ok-gtasks-client-secret))
+    (cond
+     ((stringp v) v)
+     ((functionp v)
+      (let ((s (funcall v)))
+        (unless (stringp s)
+          (signal 'ok-gtasks-auth-error '("Secret function did not return a string")))
+        s))
+     ((null v)
+      (signal 'ok-gtasks-auth-error '("`ok-gtasks-client-secret' is not set")))
+     (t (signal 'ok-gtasks-auth-error
+                (list (format "Invalid secret type: %S" v)))))))
+
+(defun ok-gtasks--form-urlencode (alist)
+  "Encode ALIST as application/x-www-form-urlencoded."
+  (mapconcat (lambda (kv)
+               (concat (url-hexify-string (car kv))
+                       "=" (url-hexify-string (cdr kv))))
+             alist "&"))
+
+(defun ok-gtasks--ensure-access-token ()
+  "Return a valid access token, refreshing if needed."
+  (if (and ok-gtasks--access-token
+           (> ok-gtasks--access-token-expiry (+ (float-time) 60)))
+      ok-gtasks--access-token
+    (let ((refresh (ok-gtasks--read-refresh-token)))
+      (unless refresh
+        (signal 'ok-gtasks-auth-error '("No refresh token; run `ok-gtasks-authorize'")))
+      (let* ((form-data (ok-gtasks--form-urlencode
+                         `(("client_id" . ,(or ok-gtasks-client-id ""))
+                           ("client_secret" . ,(ok-gtasks--client-secret))
+                           ("refresh_token" . ,refresh)
+                           ("grant_type" . "refresh_token"))))
+             (resp (ok-gtasks--http
+                    "POST" ok-gtasks--oauth-token-url
+                    '(("Content-Type" . "application/x-www-form-urlencoded"))
+                    (encode-coding-string form-data 'utf-8)))
+             (status (car resp))
+             (data (cdr resp))
+             (access (alist-get 'access_token data))
+             (expires (or (alist-get 'expires_in data) 3600)))
+        (unless access
+          (signal 'ok-gtasks-auth-error
+                  (list (format "Token refresh failed (status %s): %S" status data))))
+        (setq ok-gtasks--access-token access
+              ok-gtasks--access-token-expiry (+ (float-time) (float expires)))
+        access))))
+
+(defun ok-gtasks-authorize ()
+  "Run the OAuth2 authorization flow interactively.
+Opens a browser for consent, then prompts for the authorization code."
+  (interactive)
+  (unless (and ok-gtasks-client-id ok-gtasks-client-secret)
+    (signal 'ok-gtasks-auth-error
+            '("Set `ok-gtasks-client-id' and `ok-gtasks-client-secret' first")))
+  (let* ((auth-url (concat ok-gtasks--oauth-auth-url
+                           "?client_id=" (url-hexify-string ok-gtasks-client-id)
+                           "&response_type=code"
+                           "&redirect_uri=" (url-hexify-string ok-gtasks--redirect-uri)
+                           "&scope=" (url-hexify-string ok-gtasks--oauth-scope)
+                           "&access_type=offline&prompt=consent"))
+         (code (progn
+                 (browse-url auth-url)
+                 (read-string "Paste the authorization code: ")))
+         (form-data (ok-gtasks--form-urlencode
+                     `(("client_id" . ,ok-gtasks-client-id)
+                       ("client_secret" . ,(ok-gtasks--client-secret))
+                       ("code" . ,code)
+                       ("redirect_uri" . ,ok-gtasks--redirect-uri)
+                       ("grant_type" . "authorization_code"))))
+         (resp (ok-gtasks--http
+                "POST" ok-gtasks--oauth-token-url
+                '(("Content-Type" . "application/x-www-form-urlencoded"))
+                (encode-coding-string form-data 'utf-8)))
+         (data (cdr resp))
+         (refresh (alist-get 'refresh_token data)))
+    (unless refresh
+      (signal 'ok-gtasks-auth-error
+              (list (format "No refresh_token in response: %S" data))))
+    (ok-gtasks--write-refresh-token refresh)
+    (message "ok-gtasks: refresh token saved to %s" ok-gtasks-token-file)))
+#+end_src
+
+* API Layer
+
+#+begin_src emacs-lisp
+(defun ok-gtasks--api (method path &optional body params)
+  "Make an authenticated Google Tasks API request.
+METHOD is the HTTP method.
+PATH starts with / (e.g. \"/users/@me/lists\").
+BODY is an alist to JSON-encode, or nil.
+PARAMS is an alist of query parameters.
+Returns the parsed JSON response (alist).
+Retries once on 401 (token expired)."
+  (let* ((token (ok-gtasks--ensure-access-token))
+         (qs (when params
+               (mapconcat (lambda (kv)
+                            (concat (url-hexify-string (car kv))
+                                    "=" (url-hexify-string (cdr kv))))
+                          params "&")))
+         (url (concat (replace-regexp-in-string "/$" "" ok-gtasks-api-root)
+                      path
+                      (when qs (concat "?" qs))))
+         (headers `(("Authorization" . ,(concat "Bearer " token))
+                    ("Accept" . "application/json")
+                    ,@(when body
+                        '(("Content-Type" . "application/json; charset=UTF-8")))))
+         (encoded-body (when body (ok-gtasks--json-encode body)))
+         (resp (ok-gtasks--http method url headers encoded-body))
+         (status (car resp)))
+    (if (eq status 401)
+        ;; Token expired — clear and retry once
+        (progn
+          (setq ok-gtasks--access-token nil
+                ok-gtasks--access-token-expiry 0)
+          (let* ((new-token (ok-gtasks--ensure-access-token))
+                 (headers2 `(("Authorization" . ,(concat "Bearer " new-token))
+                             ("Accept" . "application/json")
+                             ,@(when body
+                                 '(("Content-Type" . "application/json; charset=UTF-8")))))
+                 (resp2 (ok-gtasks--http method url headers2 encoded-body))
+                 (status2 (car resp2)))
+            (unless (and (>= status2 200) (< status2 300))
+              (signal 'ok-gtasks-http-error
+                      (list (format "%s %s → %s: %S" method path status2 (cdr resp2)))))
+            (cdr resp2)))
+      (unless (and (>= status 200) (< status 300))
+        (signal 'ok-gtasks-http-error
+                (list (format "%s %s → %s: %S" method path status (cdr resp)))))
+      (cdr resp))))
+
+;;; TaskList API
+
+(defun ok-gtasks-api-list-tasklists ()
+  "Fetch all tasklists (paginated). Returns a vector of alist entries."
+  (let ((all (vector))
+        (params nil)
+        done)
+    (while (not done)
+      (let* ((data (ok-gtasks--api "GET" "/users/@me/lists" nil params))
+             (items (alist-get 'items data))
+             (next (alist-get 'nextPageToken data)))
+        (when items
+          (setq all (vconcat all items)))
+        (if next
+            (setq params `(("pageToken" . ,next)))
+          (setq done t))))
+    all))
+
+(defun ok-gtasks-api-insert-tasklist (title)
+  "Create a new tasklist with TITLE. Returns the created tasklist alist."
+  (ok-gtasks--api "POST" "/users/@me/lists" `((title . ,title))))
+
+(defun ok-gtasks-api-patch-tasklist (list-id fields)
+  "Patch tasklist LIST-ID with FIELDS alist."
+  (ok-gtasks--api "PATCH"
+                  (format "/users/@me/lists/%s" (url-hexify-string list-id))
+                  fields))
+
+;;; Task API
+
+(defun ok-gtasks-api-list-tasks (list-id &optional show-completed)
+  "Fetch all tasks in LIST-ID (paginated).
+When SHOW-COMPLETED is non-nil, include completed tasks.
+Returns a vector of task alists."
+  (let ((all (vector))
+        (params `(("maxResults" . "100")
+                  ("showCompleted" . ,(if show-completed "true" "false"))
+                  ("showHidden" . ,(if show-completed "true" "false"))))
+        done)
+    (while (not done)
+      (let* ((data (ok-gtasks--api "GET"
+                                   (format "/lists/%s/tasks"
+                                           (url-hexify-string list-id))
+                                   nil params))
+             (items (alist-get 'items data))
+             (next (alist-get 'nextPageToken data)))
+        (when items
+          (setq all (vconcat all items)))
+        (if next
+            (setf (alist-get "pageToken" params nil 'remove #'string=) next)
+          (setq done t))))
+    all))
+
+(defun ok-gtasks-api-insert-task (list-id task &optional parent-id)
+  "Create TASK in LIST-ID. TASK is an alist with title, notes, due, status.
+When PARENT-ID is non-nil, create as a sub-task.
+Returns the created task alist."
+  (let ((params (when parent-id `(("parent" . ,parent-id)))))
+    (ok-gtasks--api "POST"
+                    (format "/lists/%s/tasks" (url-hexify-string list-id))
+                    task
+                    params)))
+
+(defun ok-gtasks-api-patch-task (list-id task-id fields)
+  "Patch TASK-ID in LIST-ID with FIELDS alist."
+  (ok-gtasks--api "PATCH"
+                  (format "/lists/%s/tasks/%s"
+                          (url-hexify-string list-id)
+                          (url-hexify-string task-id))
+                  fields))
+
+(defun ok-gtasks-api-delete-task (list-id task-id)
+  "Delete TASK-ID from LIST-ID."
+  (ok-gtasks--api "DELETE"
+                  (format "/lists/%s/tasks/%s"
+                          (url-hexify-string list-id)
+                          (url-hexify-string task-id))))
+#+end_src
+
+* Org File Operations
+
+#+begin_src emacs-lisp
+;;; Date helpers
+
+(defun ok-gtasks--rfc3339-to-org-date (rfc3339)
+  "Extract YYYY-MM-DD from RFC3339 string, return as Org date <YYYY-MM-DD Day>.
+Returns nil if RFC3339 is nil."
+  (when (and rfc3339 (string-match "\\`\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" rfc3339))
+    (let* ((date-str (match-string 1 rfc3339))
+           (time (date-to-time (concat date-str "T00:00:00Z")))
+           (day (format-time-string "%a" time t)))
+      (format "<%s %s>" date-str day))))
+
+(defun ok-gtasks--org-date-to-rfc3339 (org-date)
+  "Convert Org date string like <2025-01-15 Wed> to RFC3339 midnight UTC.
+Returns nil if ORG-DATE is nil or doesn't contain a date."
+  (when (and org-date
+             (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" org-date))
+    (format "%sT00:00:00.000Z" (match-string 1 org-date))))
+
+(defun ok-gtasks--rfc3339-to-org-timestamp (rfc3339)
+  "Convert RFC3339 timestamp to Org inactive timestamp [YYYY-MM-DD Day HH:MM].
+Returns nil if RFC3339 is nil."
+  (when rfc3339
+    (let ((time (ignore-errors (date-to-time rfc3339))))
+      (when time
+        (format-time-string "[%Y-%m-%d %a %H:%M]" time)))))
+
+;;; Property helpers
+
+(defun ok-gtasks--get-prop (name)
+  "Get property NAME from the heading at point."
+  (org-entry-get nil name))
+
+(defun ok-gtasks--put-prop (name value)
+  "Set property NAME to VALUE on the heading at point."
+  (org-entry-put nil name value))
+
+(defun ok-gtasks--find-entry-by-prop (prop value)
+  "Find a heading where property PROP equals VALUE.
+Returns the position, or nil."
+  (org-find-property prop value))
+
+;;; Heading operations
+
+(defun ok-gtasks--ensure-list-heading (title list-id)
+  "Find or create a level-1 heading for a tasklist.
+Sets GTASKS_LIST_ID property. Returns the marker position."
+  (let ((pos (ok-gtasks--find-entry-by-prop "GTASKS_LIST_ID" list-id)))
+    (if pos
+        (progn (goto-char pos) pos)
+      ;; Create new heading at end of buffer
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert "* " title "\n")
+      (forward-line -1)
+      (org-entry-put nil "GTASKS_LIST_ID" list-id)
+      (point))))
+
+(defun ok-gtasks--update-body (notes)
+  "Replace the body text of the heading at point with NOTES.
+Preserves the property drawer and planning lines."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((heading-end (save-excursion (org-end-of-subtree t t) (point))))
+      ;; Move past the heading line
+      (forward-line 1)
+      ;; Skip planning lines (SCHEDULED, DEADLINE, CLOSED)
+      (progn
+        (while (and (< (point) heading-end)
+                    (looking-at "^\\s-*\\(SCHEDULED\\|DEADLINE\\|CLOSED\\):"))
+          (forward-line 1))
+        ;; Skip property drawer
+        (when (looking-at "^\\s-*:PROPERTIES:")
+          (re-search-forward "^\\s-*:END:" heading-end t)
+          (forward-line 1))
+        ;; Now delete everything from here to the end of this entry
+        ;; (but not sub-headings)
+        (let ((body-start (point))
+              (body-end (save-excursion
+                          (if (re-search-forward "^\\*" heading-end t)
+                              (match-beginning 0)
+                            heading-end))))
+          (delete-region body-start body-end)
+          (when (and notes (not (string-empty-p notes)))
+            (insert notes "\n")))))))
+
+(defun ok-gtasks--get-clean-body ()
+  "Extract plain body text from the heading at point for the API notes field.
+Strips all org metadata: property drawer, planning lines, LOGBOOK,
+state-change entries, timestamps, and sub-headings.
+Returns nil when no meaningful text remains."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point))))
+      (forward-line 1)
+      ;; Skip planning lines
+      (while (and (< (point) subtree-end)
+                  (looking-at "^\\s-*\\(SCHEDULED\\|DEADLINE\\|CLOSED\\):"))
+        (forward-line 1))
+      ;; Skip property drawer
+      (when (looking-at "^\\s-*:PROPERTIES:")
+        (re-search-forward "^\\s-*:END:" subtree-end t)
+        (forward-line 1))
+      ;; Collect body until next heading or end
+      (let* ((body-start (point))
+             (body-end (save-excursion
+                         (if (re-search-forward "^\\*" subtree-end t)
+                             (match-beginning 0)
+                           subtree-end)))
+             (raw (buffer-substring-no-properties body-start body-end)))
+        ;; Clean org metadata from the raw text
+        (let ((clean
+               (with-temp-buffer
+                 (insert raw)
+                 ;; Remove drawers (:LOGBOOK:...:END:, etc.)
+                 (goto-char (point-min))
+                 (while (re-search-forward
+                         "^\\s-*:[A-Z_]+:\\s-*\n\\(?:.*\n\\)*?\\s-*:END:\\s-*$"
+                         nil t)
+                   (replace-match ""))
+                 ;; Remove state-change lines (- State "DONE" from "TODO" [...])
+                 (goto-char (point-min))
+                 (flush-lines "^\\s-*- State \"")
+                 ;; Remove bare timestamps (<...> or [...] on their own line)
+                 (goto-char (point-min))
+                 (flush-lines
+                  "^\\s-*\\(?:<[^>\n]+>\\|\\[[^]\n]+\\]\\)\\s-*$")
+                 ;; Trim
+                 (string-trim (buffer-string)))))
+          (if (string-empty-p clean) nil clean))))))
+
+(defun ok-gtasks--set-todo-state (target-state)
+  "Set TODO state to TARGET-STATE only if it differs from current.
+Suppresses org-todo logging noise."
+  (let ((current (org-get-todo-state)))
+    (unless (equal current target-state)
+      (let ((org-log-done nil)
+            (org-log-repeat nil)
+            (org-todo-log-states nil))
+        (org-todo target-state)))))
+
+(defun ok-gtasks--update-task-heading (task)
+  "Update the heading at point from remote TASK alist.
+Updates title, TODO state, SCHEDULED, CLOSED, body, and properties."
+  (let ((title (or (alist-get 'title task) "(no title)"))
+        (status (alist-get 'status task))
+        (due (alist-get 'due task))
+        (completed (alist-get 'completed task))
+        (notes (alist-get 'notes task))
+        (task-id (alist-get 'id task))
+        (etag (alist-get 'etag task))
+        (updated (alist-get 'updated task))
+        (parent (alist-get 'parent task)))
+    (org-back-to-heading t)
+    (ok-gtasks--log 'debug "update: %s" title)
+    ;; Update heading title and TODO state
+    (let ((done-p (equal status "completed")))
+      (org-edit-headline title)
+      (ok-gtasks--set-todo-state (if done-p "DONE" "TODO")))
+    ;; Update SCHEDULED date
+    (let ((inhibit-message t))
+      (if due
+          (let ((org-date (ok-gtasks--rfc3339-to-org-date due)))
+            (when org-date
+              (org-schedule nil org-date)))
+        ;; Remove SCHEDULED if no due date
+        (when (org-entry-get nil "SCHEDULED")
+          (org-schedule '(4)))))
+    ;; Update CLOSED timestamp
+    (when (equal status "completed")
+      (when completed
+        (let ((ts (ok-gtasks--rfc3339-to-org-timestamp completed)))
+          (when ts
+            (org-add-planning-info 'closed ts)))))
+    ;; Update body (notes)
+    (ok-gtasks--update-body notes)
+    ;; Update properties
+    (ok-gtasks--put-prop "GTASKS_TASK_ID" task-id)
+    (when etag (ok-gtasks--put-prop "GTASKS_ETAG" etag))
+    (when updated (ok-gtasks--put-prop "GTASKS_UPDATED" updated))
+    (when parent (ok-gtasks--put-prop "GTASKS_PARENT_ID" parent))))
+
+(defun ok-gtasks--insert-task-heading (task level)
+  "Insert a new heading for TASK at LEVEL (2 for tasks, 3 for sub-tasks).
+Point should be at the end of the parent section."
+  (let ((title (or (alist-get 'title task) "(no title)"))
+        (status (alist-get 'status task))
+        (due (alist-get 'due task))
+        (completed (alist-get 'completed task))
+        (notes (alist-get 'notes task))
+        (task-id (alist-get 'id task))
+        (etag (alist-get 'etag task))
+        (updated (alist-get 'updated task))
+        (parent (alist-get 'parent task))
+        (done-p nil))
+    (setq done-p (equal status "completed"))
+    ;; Insert at end of current section
+    (unless (bolp) (insert "\n"))
+    (insert (make-string level ?*) " "
+            (if done-p "DONE" "TODO") " "
+            title "\n")
+    (forward-line -1)
+    ;; Planning lines
+    (save-excursion
+      (end-of-line)
+      (when (and done-p completed)
+        (let ((ts (ok-gtasks--rfc3339-to-org-timestamp completed)))
+          (when ts (insert "\nCLOSED: " ts))))
+      (when due
+        (let ((org-date (ok-gtasks--rfc3339-to-org-date due)))
+          (when org-date (insert "\nSCHEDULED: " org-date)))))
+    ;; Properties
+    (ok-gtasks--put-prop "GTASKS_TASK_ID" task-id)
+    (when etag (ok-gtasks--put-prop "GTASKS_ETAG" etag))
+    (when updated (ok-gtasks--put-prop "GTASKS_UPDATED" updated))
+    (when parent (ok-gtasks--put-prop "GTASKS_PARENT_ID" parent))
+    ;; Body
+    (when (and notes (not (string-empty-p notes)))
+      (org-end-of-meta-data t)
+      (insert notes "\n"))))
+#+end_src
+
+* Sync Logic
+
+** Pull (remote wins)
+
+#+begin_src emacs-lisp
+(defun ok-gtasks--pull-list (list-id list-title)
+  "Pull tasks for a single tasklist LIST-ID (LIST-TITLE) into the current buffer.
+Returns (NEW UPDATED ORPHAN) counts."
+  (ok-gtasks--log 'info "pulling list: %s" list-title)
+  (let ((new-count 0) (updated-count 0) (orphan-count 0)
+        (remote-tasks (ok-gtasks-api-list-tasks list-id t))
+        (remote-ids (make-hash-table :test 'equal)))
+    (ok-gtasks--ensure-list-heading list-title list-id)
+    ;; Collect remote task IDs
+    (seq-doseq (task remote-tasks)
+      (puthash (alist-get 'id task) t remote-ids))
+    ;; First pass: top-level tasks (no parent)
+    (seq-doseq (task remote-tasks)
+      (unless (alist-get 'parent task)
+        (let ((pos (ok-gtasks--find-entry-by-prop
+                    "GTASKS_TASK_ID" (alist-get 'id task))))
+          (if pos
+              (progn
+                (goto-char pos)
+                (ok-gtasks--update-task-heading task)
+                (cl-incf updated-count))
+            (ok-gtasks--log 'debug "new: %s" (alist-get 'title task))
+            (ok-gtasks--goto-list-section-end list-id)
+            (ok-gtasks--insert-task-heading task 2)
+            (cl-incf new-count)))))
+    ;; Second pass: sub-tasks (have parent)
+    (seq-doseq (task remote-tasks)
+      (when (alist-get 'parent task)
+        (let ((pos (ok-gtasks--find-entry-by-prop
+                    "GTASKS_TASK_ID" (alist-get 'id task))))
+          (if pos
+              (progn
+                (goto-char pos)
+                (ok-gtasks--update-task-heading task)
+                (cl-incf updated-count))
+            (ok-gtasks--log 'debug "new sub-task: %s" (alist-get 'title task))
+            (let ((parent-pos (ok-gtasks--find-entry-by-prop
+                               "GTASKS_TASK_ID" (alist-get 'parent task))))
+              (if parent-pos
+                  (progn
+                    (goto-char parent-pos)
+                    (org-end-of-subtree t t)
+                    (ok-gtasks--insert-task-heading task 3)
+                    (cl-incf new-count))
+                (ok-gtasks--goto-list-section-end list-id)
+                (ok-gtasks--insert-task-heading task 2)
+                (cl-incf new-count)))))))
+    ;; Orphan detection
+    (save-excursion
+      (goto-char (ok-gtasks--find-entry-by-prop "GTASKS_LIST_ID" list-id))
+      (let ((section-end (save-excursion (org-end-of-subtree t t) (point))))
+        (while (re-search-forward "^\\*\\*+ " section-end t)
+          (let ((local-task-id (org-entry-get nil "GTASKS_TASK_ID")))
+            (when (and local-task-id
+                       (not (gethash local-task-id remote-ids))
+                       (not (equal (org-get-todo-state) "DONE")))
+              (ok-gtasks--log 'debug "orphan: %s" (org-get-heading t t t t))
+              (ok-gtasks--set-todo-state "DONE")
+              (cl-incf orphan-count))))))
+    (list new-count updated-count orphan-count)))
+
+(defun ok-gtasks--pull-all ()
+  "Pull all tasklists and tasks from Google Tasks."
+  (let ((file (expand-file-name ok-gtasks-file))
+        (new-total 0) (updated-total 0) (orphan-total 0))
+    (unless (file-exists-p file)
+      (with-temp-file file
+        (insert "#+TITLE: Google Tasks\n\n")))
+    (with-current-buffer (find-file-noselect file)
+      (let ((tasklists (ok-gtasks-api-list-tasklists)))
+        (ok-gtasks--log 'info "fetching %d lists" (length tasklists))
+        (seq-doseq (tl tasklists)
+          (let ((counts (ok-gtasks--pull-list
+                         (alist-get 'id tl) (alist-get 'title tl))))
+            (cl-incf new-total (nth 0 counts))
+            (cl-incf updated-total (nth 1 counts))
+            (cl-incf orphan-total (nth 2 counts)))))
+      (save-buffer)
+      (message "ok-gtasks pull: %d new, %d updated, %d orphaned"
+               new-total updated-total orphan-total))))
+
+(defun ok-gtasks--pull-heading-at-point ()
+  "Pull the tasklist at point (level 1 heading with GTASKS_LIST_ID)."
+  (org-back-to-heading t)
+  ;; Navigate to the level-1 ancestor
+  (while (and (> (org-outline-level) 1)
+              (org-up-heading-safe)))
+  (unless (= (org-outline-level) 1)
+    (user-error "Not inside a task list heading"))
+  (let* ((list-id (org-entry-get nil "GTASKS_LIST_ID"))
+         (list-title (org-get-heading t t t t)))
+    (unless list-id
+      (user-error "No GTASKS_LIST_ID on heading \"%s\"" list-title))
+    (let ((counts (ok-gtasks--pull-list list-id list-title)))
+      (save-buffer)
+      (message "ok-gtasks pull [%s]: %d new, %d updated, %d orphaned"
+               list-title (nth 0 counts) (nth 1 counts) (nth 2 counts)))))
+
+(defun ok-gtasks--goto-list-section-end (list-id)
+  "Move point to the end of the section for LIST-ID."
+  (let ((pos (ok-gtasks--find-entry-by-prop "GTASKS_LIST_ID" list-id)))
+    (when pos
+      (goto-char pos)
+      (org-end-of-subtree t t)
+      ;; Back up if we're at the start of the next heading
+      (when (and (not (eobp)) (looking-at "^\\*"))
+        (forward-line -1)
+        (end-of-line)))))
+#+end_src
+
+** Push (local scope)
+
+#+begin_src emacs-lisp
+(defun ok-gtasks--find-parent-list-id ()
+  "Find the GTASKS_LIST_ID from the nearest level-1 ancestor heading."
+  (save-excursion
+    (while (and (> (org-outline-level) 1)
+                (org-up-heading-safe)))
+    (when (= (org-outline-level) 1)
+      (org-entry-get nil "GTASKS_LIST_ID"))))
+
+(defun ok-gtasks--push-heading-at-point ()
+  "Push the heading at point based on its level.
+Level 1: push the tasklist and all its tasks.
+Level 2: push the task and its sub-tasks.
+Level 3: push the sub-task only."
+  (org-back-to-heading t)
+  (let ((level (org-outline-level))
+        (created 0)
+        (updated 0))
+    (pcase level
+      (1
+       ;; Push tasklist + all tasks/sub-tasks
+       (let* ((list-title (org-get-heading t t t t))
+              (list-id (ok-gtasks--get-prop "GTASKS_LIST_ID"))
+              (section-end (save-excursion (org-end-of-subtree t t) (point))))
+         (unless list-id
+           (let ((resp (ok-gtasks-api-insert-tasklist list-title)))
+             (setq list-id (alist-get 'id resp))
+             (ok-gtasks--put-prop "GTASKS_LIST_ID" list-id)
+             (cl-incf created)))
+         ;; Push level-2 tasks
+         (save-excursion
+           (forward-line 1)
+           (while (and (< (point) section-end)
+                       (re-search-forward "^\\*\\* " section-end t))
+             (org-back-to-heading t)
+             (when (= (org-outline-level) 2)
+               (let ((counts (ok-gtasks--push-single-task list-id nil)))
+                 (cl-incf created (car counts))
+                 (cl-incf updated (cdr counts)))
+               ;; Sub-tasks under this task
+               (let ((task-id (ok-gtasks--get-prop "GTASKS_TASK_ID"))
+                     (task-end (save-excursion (org-end-of-subtree t t) (point))))
+                 (save-excursion
+                   (forward-line 1)
+                   (while (and (< (point) task-end)
+                               (re-search-forward "^\\*\\*\\* " task-end t))
+                     (org-back-to-heading t)
+                     (when (= (org-outline-level) 3)
+                       (let ((counts (ok-gtasks--push-single-task list-id task-id)))
+                         (cl-incf created (car counts))
+                         (cl-incf updated (cdr counts))))))))
+             (unless (eobp) (forward-line 1))))))
+      (2
+       ;; Push single task + its sub-tasks
+       (let ((list-id (ok-gtasks--find-parent-list-id)))
+         (unless list-id (user-error "No GTASKS_LIST_ID on parent heading"))
+         (let ((counts (ok-gtasks--push-single-task list-id nil)))
+           (cl-incf created (car counts))
+           (cl-incf updated (cdr counts)))
+         ;; Sub-tasks
+         (let ((task-id (ok-gtasks--get-prop "GTASKS_TASK_ID"))
+               (task-end (save-excursion (org-end-of-subtree t t) (point))))
+           (save-excursion
+             (forward-line 1)
+             (while (and (< (point) task-end)
+                         (re-search-forward "^\\*\\*\\* " task-end t))
+               (org-back-to-heading t)
+               (when (= (org-outline-level) 3)
+                 (let ((counts (ok-gtasks--push-single-task list-id task-id)))
+                   (cl-incf created (car counts))
+                   (cl-incf updated (cdr counts)))))))))
+      (3
+       ;; Push single sub-task
+       (let ((list-id (ok-gtasks--find-parent-list-id)))
+         (unless list-id (user-error "No GTASKS_LIST_ID on ancestor heading"))
+         (let* ((parent-id (save-excursion
+                             (org-up-heading-safe)
+                             (org-entry-get nil "GTASKS_TASK_ID")))
+                (counts (ok-gtasks--push-single-task list-id parent-id)))
+           (cl-incf created (car counts))
+           (cl-incf updated (cdr counts)))))
+      (_ (user-error "Push only works on level 1-3 headings")))
+    (save-buffer)
+    (message "ok-gtasks push: %d created, %d updated" created updated)))
+
+(defun ok-gtasks--push-single-task (list-id parent-id)
+  "Push the task at point to LIST-ID.
+PARENT-ID is the remote parent task ID for sub-tasks, or nil.
+Point must be on the heading.
+Returns (CREATED . UPDATED) counts."
+  (let* ((task-id (ok-gtasks--get-prop "GTASKS_TASK_ID"))
+         (title (org-get-heading t t t t))
+         (todo-state (org-get-todo-state))
+         (scheduled (org-entry-get nil "SCHEDULED"))
+         (closed (org-entry-get nil "CLOSED"))
+         (body (ok-gtasks--get-clean-body))
+         (status (if (equal todo-state "DONE") "completed" "needsAction"))
+         (payload `((title . ,title)
+                    (status . ,status)
+                    ,@(when body `((notes . ,body)))
+                    ,@(when scheduled
+                        (let ((rfc (ok-gtasks--org-date-to-rfc3339 scheduled)))
+                          (when rfc `((due . ,rfc)))))
+                    ,@(when (and (equal status "completed") closed)
+                        (let ((rfc (ok-gtasks--org-date-to-rfc3339 closed)))
+                          (when rfc `((completed . ,rfc))))))))
+    (ok-gtasks--log 'debug "%s: %s" (if task-id "patch" "create") title)
+    (if task-id
+        ;; Update existing task — include id in body
+        (let* ((full-payload (cons `(id . ,task-id) payload))
+               (resp (ok-gtasks-api-patch-task list-id task-id full-payload)))
+          (when resp
+            (let ((etag (alist-get 'etag resp))
+                  (updated (alist-get 'updated resp)))
+              (when etag (ok-gtasks--put-prop "GTASKS_ETAG" etag))
+              (when updated (ok-gtasks--put-prop "GTASKS_UPDATED" updated))))
+          (cons 0 1))
+      ;; Create new task
+      (let ((resp (ok-gtasks-api-insert-task list-id payload parent-id)))
+        (when resp
+          (ok-gtasks--put-prop "GTASKS_TASK_ID" (alist-get 'id resp))
+          (when parent-id (ok-gtasks--put-prop "GTASKS_PARENT_ID" parent-id))
+          (let ((etag (alist-get 'etag resp))
+                (updated (alist-get 'updated resp)))
+            (when etag (ok-gtasks--put-prop "GTASKS_ETAG" etag))
+            (when updated (ok-gtasks--put-prop "GTASKS_UPDATED" updated)))))
+      (cons 1 0))))
+#+end_src
+
+* Interactive Commands
+
+#+begin_src emacs-lisp
+(defun ok-gtasks--in-gtasks-file-p ()
+  "Return non-nil if the current buffer is visiting `ok-gtasks-file'."
+  (and buffer-file-name
+       (file-equal-p buffer-file-name (expand-file-name ok-gtasks-file))))
+
+;;;###autoload
+(defun ok-gtasks-pull (&optional full)
+  "Pull Google Tasks into the local Org file.
+When in `ok-gtasks-file': pull only the task list at point.
+Otherwise (or with \\[universal-argument]): pull all lists."
+  (interactive "P")
+  (if (and (not full) (ok-gtasks--in-gtasks-file-p))
+      (ok-gtasks--pull-heading-at-point)
+    (ok-gtasks--pull-all)))
+
+;;;###autoload
+(defun ok-gtasks-push (&optional full)
+  "Push local Org changes to Google Tasks.
+When in `ok-gtasks-file': push the heading at point.
+  * heading  → entire task list and its tasks.
+  ** heading → task and its sub-tasks.
+  *** heading → just the sub-task.
+With \\[universal-argument]: push all lists."
+  (interactive "P")
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Not in an org-mode buffer"))
+  (if (and (not full) (ok-gtasks--in-gtasks-file-p))
+      (ok-gtasks--push-heading-at-point)
+    ;; Full push: iterate all level-1 headings
+    (let ((file (expand-file-name ok-gtasks-file)))
+      (with-current-buffer (find-file-noselect file)
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward "^\\* " nil t)
+            (org-back-to-heading t)
+            (when (= (org-outline-level) 1)
+              (let ((pos (point)))
+                (ok-gtasks--push-heading-at-point)
+                (goto-char pos)
+                (org-end-of-subtree t t))))
+          (save-buffer))))))
+#+end_src
+
+* Provide Feature
+
+#+begin_src emacs-lisp
+(provide 'ok-gtasks)
+;;; ok-gtasks.el ends here
+#+end_src
