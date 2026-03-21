@@ -1,10 +1,3 @@
-#+TITLE: ok-gtasks - Google Tasks Sync for Org-mode
-#+AUTHOR: Oleksii
-#+PROPERTY: header-args:emacs-lisp :tangle ok-gtasks.el :results silent
-
-* Package Header
-
-#+begin_src emacs-lisp
 ;;; ok-gtasks.el --- Google Tasks bidirectional sync for Org-mode -*- lexical-binding: t; -*-
 
 ;; Author: Oleksii
@@ -47,11 +40,7 @@
 (require 'org)
 (require 'cl-lib)
 (require 'subr-x)
-#+end_src
 
-* Configuration
-
-#+begin_src emacs-lisp
 (defgroup ok-gtasks nil
   "Google Tasks bidirectional sync for Org-mode."
   :group 'tools
@@ -141,11 +130,7 @@ Added as a hook via `ok-gtasks-mode-setup'."
       (org-set-regexps-and-options))))
 
 (add-hook 'org-mode-hook #'ok-gtasks--setup-keywords)
-#+end_src
 
-* HTTP Backend
-
-#+begin_src emacs-lisp
 (defun ok-gtasks--effective-backend ()
   "Return the HTTP backend to use: `curl' or `url'."
   (pcase ok-gtasks-http-backend
@@ -231,11 +216,7 @@ Returns (STATUS-CODE . PARSED-JSON)."
   (pcase (ok-gtasks--effective-backend)
     ('curl (ok-gtasks--http-curl method url headers body))
     ('url (ok-gtasks--http-url method url headers body))))
-#+end_src
 
-* Authentication
-
-#+begin_src emacs-lisp
 (defconst ok-gtasks--oauth-auth-url
   "https://accounts.google.com/o/oauth2/v2/auth")
 
@@ -351,11 +332,7 @@ Opens a browser for consent, then prompts for the authorization code."
               (list (format "No refresh_token in response: %S" data))))
     (ok-gtasks--write-refresh-token refresh)
     (message "ok-gtasks: refresh token saved to %s" ok-gtasks-token-file)))
-#+end_src
 
-* API Layer
-
-#+begin_src emacs-lisp
 (defun ok-gtasks--api-once (method url headers encoded-body)
   "Execute a single HTTP request, handle 401 retry.
 Returns (STATUS . DATA)."
@@ -503,11 +480,7 @@ FIELDS must include `id'."
                   (format "/lists/%s/tasks/%s"
                           (url-hexify-string list-id)
                           (url-hexify-string task-id))))
-#+end_src
 
-* Org File Operations
-
-#+begin_src emacs-lisp
 ;;; Date helpers
 
 (defun ok-gtasks--rfc3339-to-org-date (rfc3339)
@@ -727,13 +700,7 @@ Point should be at the end of the parent section."
     (when (and notes (not (string-empty-p notes)))
       (org-end-of-meta-data t)
       (insert notes "\n"))))
-#+end_src
 
-* Sync Logic
-
-** Pull (remote wins)
-
-#+begin_src emacs-lisp
 (defun ok-gtasks--pull-list (list-id list-title)
   "Pull tasks for a single tasklist LIST-ID (LIST-TITLE) into the current buffer.
 Returns (NEW UPDATED ORPHAN) counts."
@@ -842,11 +809,7 @@ Returns (NEW UPDATED ORPHAN) counts."
       (when (and (not (eobp)) (looking-at "^\\*"))
         (forward-line -1)
         (end-of-line)))))
-#+end_src
 
-** Push (local scope)
-
-#+begin_src emacs-lisp
 (defun ok-gtasks--find-parent-list-id ()
   "Find the GTASKS_LIST_ID from the nearest level-1 ancestor heading."
   (save-excursion
@@ -976,11 +939,7 @@ Returns (CREATED . UPDATED) counts."
             (when etag (ok-gtasks--put-prop "GTASKS_ETAG" etag))
             (when updated (ok-gtasks--put-prop "GTASKS_UPDATED" updated)))))
       (cons 1 0)))))
-#+end_src
 
-* Interactive Commands
-
-#+begin_src emacs-lisp
 (defun ok-gtasks--in-gtasks-file-p ()
   "Return non-nil if the current buffer is visiting `ok-gtasks-file'."
   (and buffer-file-name
@@ -1153,11 +1112,6 @@ Use this to verify your OAuth2 token has write permissions."
             (error (message "ok-gtasks test: DELETE failed (task left in \"%s\")" list-title))))
       (error (message "ok-gtasks test: POST FAILED: %s\nTry: M-x ok-gtasks-authorize"
                       (error-message-string err))))))
-#+end_src
 
-* Provide Feature
-
-#+begin_src emacs-lisp
 (provide 'ok-gtasks)
 ;;; ok-gtasks.el ends here
-#+end_src
