@@ -5,18 +5,21 @@ Bidirectional sync between Google Tasks and a single Org file.
 
 - =ok-gtasks-pull= fetches tasks from Google into Org (remote wins)
 - =ok-gtasks-push= pushes local changes to Google Tasks (update-or-create)
+- =ok-gtasks-delete= deletes tasks marked =DEL= from Google Tasks and locally
 
 Built as a literate Org package. See [[file:ok-gtasks.org][ok-gtasks.org]] for full source and implementation details.
 
 * Features
 
 - Bidirectional sync: pull (remote wins) and push (update-or-create)
+- Delete workflow: mark tasks with =DEL= state, then delete in batch or individually
 - Local-scope operations: sync only the heading at point, not the whole file
 - =C-u= prefix for full sync of all task lists
 - curl-primary HTTP backend (avoids Emacs =url.el= multibyte/Unicode bugs)
 - Reuses existing OAuth2 refresh token (no re-auth needed if you used =gtasks.el=)
 - Property-based tracking: no duplicates on re-import
 - Sub-task support (=***= headings under =**= tasks)
+- Orphan detection: local tasks deleted remotely are marked DONE on pull
 - Configurable verbosity (quiet / info / debug)
 
 * Org File Structure
@@ -24,21 +27,34 @@ Built as a literate Org package. See [[file:ok-gtasks.org][ok-gtasks.org]] for f
 Tasks are stored in a single Org file (default =~/org/gtasks.org=):
 
 #+begin_example
-,* My Tasks                           ← Google Tasks list (level 1)
-,** TODO Buy groceries                ← Task (level 2)
+,* My Tasks                           <- Google Tasks list (level 1)
+,** TODO Buy groceries                <- Task (level 2)
 SCHEDULED: <2026-03-20 Fri>
 :PROPERTIES:
 :GTASKS_TASK_ID: abc123
 :GTASKS_LIST_ID: xyz789
 :END:
 Some notes about what to buy.
-,*** TODO Get milk                    ← Sub-task (level 3)
+,*** TODO Get milk                    <- Sub-task (level 3)
 :PROPERTIES:
 :GTASKS_TASK_ID: def456
 :END:
-,* Work                               ← Another list
-,** DONE Finish report
+,** DONE Finish report                <- Completed task
+CLOSED: [2026-03-21 Fri 14:30]
+,** DEL Old unwanted task             <- Marked for deletion
+,* Work                               <- Another list
+,** TODO Prepare slides
 #+end_example
+
+** TODO Keywords
+
+The package automatically sets up the following TODO keywords for the gtasks file:
+
+- =TODO= -- active task (maps to Google Tasks =needsAction=)
+- =DONE= -- completed task (maps to Google Tasks =completed=)
+- =DEL= -- marked for deletion (used by =ok-gtasks-delete=)
+
+These are set buffer-locally via =org-mode-hook= and do not affect your global org configuration.
 
 * Field Mapping
 
@@ -55,6 +71,7 @@ Some notes about what to buy.
 | =GTASKS_TASK_ID= prop | task id               |
 | =GTASKS_ETAG= prop    | etag (concurrency)    |
 | =GTASKS_UPDATED= prop | last updated          |
+| =GTASKS_PARENT_ID= prop | parent task id      |
 
 ** About Org Tags
 
@@ -105,13 +122,22 @@ authorization code.
 
 ** Pull (fetch from Google)
 
+=ok-gtasks-pull= downloads tasks from Google Tasks into the local Org file.
+Pull uses a *remote wins* strategy: remote data overwrites local headings.
+
 | Context          | Command              | Effect                      |
 |------------------+----------------------+-----------------------------|
 | In =gtasks.org=  | =ok-gtasks-pull=     | Pull the task list at point |
 | In =gtasks.org=  | =C-u ok-gtasks-pull= | Pull all task lists         |
 | Any other buffer | =ok-gtasks-pull=     | Pull all task lists         |
 
+Pull also performs *orphan detection*: if a task exists locally but is no longer
+on the remote side, it is marked =DONE=.
+
 ** Push (send to Google)
+
+=ok-gtasks-push= sends local changes to Google Tasks. It creates new remote
+tasks for headings without a =GTASKS_TASK_ID=, and updates existing ones via PUT.
 
 | Context          | Command              | Effect                               |
 |------------------+----------------------+--------------------------------------|
@@ -120,12 +146,41 @@ authorization code.
 | On =***= heading | =ok-gtasks-push=     | Push single sub-task                 |
 | Any context      | =C-u ok-gtasks-push= | Push all lists                       |
 
+Tasks marked =DEL= are automatically skipped during push.
+
+** Delete (remove from Google)
+
+=ok-gtasks-delete= removes tasks marked with the =DEL= keyword from both
+Google Tasks and the local Org file.
+
+| Context          | Command              | Effect                                  |
+|------------------+----------------------+-----------------------------------------|
+| On =*= heading   | =ok-gtasks-delete=   | Delete all DEL tasks under this list    |
+| On =**= heading  | =ok-gtasks-delete=   | Delete this task (must be DEL)          |
+| On =***= heading | =ok-gtasks-delete=   | Delete this sub-task (must be DEL)      |
+
+The delete workflow avoids costly list comparisons between local and remote.
+Instead, you explicitly mark tasks for deletion:
+
+1. Change the task's state to =DEL= (e.g. =C-c C-t= or =S-right= to cycle)
+2. Call =M-x ok-gtasks-delete= on the task or its parent list heading
+3. Confirm the deletion
+
+Tasks without a =GTASKS_TASK_ID= (never synced) are simply removed locally.
+
+** Test
+
+=ok-gtasks-test= verifies that your OAuth2 token has write permissions by
+creating, updating, and deleting a test task in the first tasklist. Use this
+after initial setup or re-authorization.
+
 ** Typical Workflow
 
 1. =M-x ok-gtasks-pull= (or =C-u ok-gtasks-pull= for all lists) to import tasks
 2. Edit tasks in Org: change TODO states, add SCHEDULED dates, edit body text
 3. Position cursor on the changed heading
 4. =M-x ok-gtasks-push= to sync back to Google
+5. To remove tasks: mark them =DEL=, then =M-x ok-gtasks-delete=
 
 * Configuration
 
@@ -159,6 +214,24 @@ All Org metadata is stripped automatically:
 - Bare timestamps
 
 If a heading has no meaningful text (only metadata), =notes= is left empty.
+
+* Interactive Commands Summary
+
+| Command                | Description                                          |
+|------------------------+------------------------------------------------------|
+| =ok-gtasks-pull=       | Pull tasks from Google (scope-aware or full with C-u) |
+| =ok-gtasks-push=       | Push tasks to Google (scope-aware or full with C-u)  |
+| =ok-gtasks-delete=     | Delete DEL-marked tasks (scope-aware)                |
+| =ok-gtasks-authorize=  | Run OAuth2 authorization flow                        |
+| =ok-gtasks-test=       | Test write access with a temporary task              |
+
+* Rate Limiting
+
+The package includes built-in rate limiting to stay within Google's API quotas:
+
+- Write operations (POST, PUT, DELETE) are throttled with a 300ms delay
+- On 403/429 (quota exceeded), the request is retried once after a 2-second backoff
+- On 401 (token expired), the access token is refreshed and the request retried
 
 * Acknowledgments
 
