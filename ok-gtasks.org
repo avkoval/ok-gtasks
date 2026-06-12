@@ -553,10 +553,21 @@ Returns the position, or nil."
 
 (defun ok-gtasks--ensure-list-heading (title list-id)
   "Find or create a level-1 heading for a tasklist.
-Sets GTASKS_LIST_ID property. Returns the marker position."
+Sets GTASKS_LIST_ID property. Returns the marker position.
+If the heading already exists but its title differs from TITLE
+(e.g. the list was renamed in Google), rename it locally and
+scrub task-only metadata (TODO state, GTASKS_TASK_ID etc.) that
+may linger from when the heading was originally a task."
   (let ((pos (ok-gtasks--find-entry-by-prop "GTASKS_LIST_ID" list-id)))
     (if pos
-        (progn (goto-char pos) pos)
+        (progn
+          (goto-char pos)
+          (unless (equal (org-get-heading t t t t) title)
+            (ok-gtasks--log 'info "renaming list: %s -> %s"
+                            (org-get-heading t t t t) title)
+            (org-edit-headline title))
+          (ok-gtasks--scrub-list-heading)
+          pos)
       ;; Create new heading at end of buffer
       (goto-char (point-max))
       (unless (bolp) (insert "\n"))
@@ -564,6 +575,26 @@ Sets GTASKS_LIST_ID property. Returns the marker position."
       (forward-line -1)
       (org-entry-put nil "GTASKS_LIST_ID" list-id)
       (point))))
+
+(defun ok-gtasks--scrub-list-heading ()
+  "Strip task-only metadata from the level-1 heading at point.
+List headings should carry only GTASKS_LIST_ID — any TODO keyword,
+SCHEDULED/DEADLINE/CLOSED planning line, or task-scoped property
+(GTASKS_TASK_ID, GTASKS_PARENT_ID, GTASKS_ETAG, GTASKS_UPDATED) is
+residue from when the heading was originally a task and is removed."
+  (let ((inhibit-message t))
+    (when (org-get-todo-state)
+      (let ((org-log-done nil)
+            (org-log-repeat nil)
+            (org-todo-log-states nil))
+        (org-todo 'none)))
+    (dolist (prop '("GTASKS_TASK_ID" "GTASKS_PARENT_ID"
+                    "GTASKS_ETAG" "GTASKS_UPDATED"))
+      (when (org-entry-get nil prop)
+        (org-entry-delete nil prop)))
+    (when (org-entry-get nil "SCHEDULED") (org-schedule '(4)))
+    (when (org-entry-get nil "DEADLINE")  (org-deadline '(4)))
+    (when (org-entry-get nil "CLOSED")    (org-add-planning-info nil nil 'closed))))
 
 (defun ok-gtasks--update-body (notes)
   "Replace the body text of the heading at point with NOTES.
